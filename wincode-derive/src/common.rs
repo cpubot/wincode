@@ -13,8 +13,9 @@ use {
         rc::Rc,
     },
     syn::{
-        DeriveInput, Expr, GenericArgument, Generics, Ident, Lifetime, LitInt, Member, Path, Type,
-        TypeImplTrait, TypeParamBound, TypeReference, TypeTraitObject, Visibility, parse_quote,
+        DeriveInput, Expr, GenericArgument, GenericParam, Generics, Ident, Lifetime, LitInt,
+        Member, Path, Type, TypeImplTrait, TypeParamBound, TypeReference, TypeTraitObject,
+        Visibility, parse_quote,
         spanned::Spanned,
         visit::{self, Visit},
         visit_mut::{self, VisitMut},
@@ -294,6 +295,8 @@ impl Field {
 }
 
 pub(crate) trait FieldsExt {
+    /// Metadata in declaration order, treating skipped fields as zero-byte operations.
+    fn run_metas(&self, trait_impl: TraitImpl, crate_name: &Path) -> Vec<TokenStream>;
     fn type_meta_impl(
         &self,
         trait_impl: TraitImpl,
@@ -322,6 +325,19 @@ pub(crate) trait FieldsExt {
 }
 
 impl FieldsExt for Fields<Field> {
+    fn run_metas(&self, trait_impl: TraitImpl, crate_name: &Path) -> Vec<TokenStream> {
+        self.iter()
+            .map(|field| {
+                if field.skip.is_some() {
+                    quote! { #crate_name::TypeMeta::Static { size: 0, zero_copy: false } }
+                } else {
+                    let target = field.target_fully_qualified(trait_impl);
+                    quote! { #target::TYPE_META }
+                }
+            })
+            .collect()
+    }
+
     /// Generate the `TYPE_META` implementation for a struct.
     fn type_meta_impl(
         &self,
@@ -392,6 +408,60 @@ impl FieldsExt for Fields<Field> {
     fn fields_with_lifetime_iter(&self) -> impl Iterator<Item = &Field> {
         self.iter().filter(|field| field.has_lifetime())
     }
+}
+
+/// Explicit type/const arguments for a generated helper; lifetimes are inferred.
+pub(crate) fn helper_args(generics: &Generics) -> Vec<TokenStream> {
+    generics
+        .params
+        .iter()
+        .filter_map(|param| match param {
+            GenericParam::Lifetime(_) => None,
+            GenericParam::Type(param) => {
+                let ident = &param.ident;
+                Some(quote! { #ident })
+            }
+            GenericParam::Const(param) => {
+                let ident = &param.ident;
+                Some(quote! { #ident })
+            }
+        })
+        .collect()
+}
+
+/// Cache the plan independently of the field helper's start index. Direct const
+/// lookups let rustc discard unused calls during monomorphization, before LLVM.
+pub(crate) fn field_plan(
+    args: &SchemaArgs,
+    fields: &Fields<Field>,
+    generics: &Generics,
+    trait_impl: TraitImpl,
+    crate_name: &Path,
+) -> (TokenStream, TokenStream) {
+    let ident = &args.ident;
+    let (_, ty_generics, _) = args.generics.split_for_impl();
+    let (impl_generics, _, where_clause) = generics.split_for_impl();
+    let lifetime = match trait_impl {
+        TraitImpl::SchemaRead => quote! { 'de, },
+        TraitImpl::SchemaWrite => quote! {},
+    };
+    let num_fields = fields.len();
+    let metas = fields.run_metas(trait_impl, crate_name);
+    let definition = quote! {
+        trait __WincodeFieldPlan<#lifetime __WincodeConfig> {
+            const RUNS: [#crate_name::FieldRun; #num_fields];
+        }
+        impl #impl_generics __WincodeFieldPlan<#lifetime __WincodeConfig>
+            for #ident #ty_generics #where_clause
+        {
+            const RUNS: [#crate_name::FieldRun; #num_fields] =
+                #crate_name::TypeMeta::field_runs([#(#metas),*]);
+        }
+    };
+    let access = quote! {
+        <#ident #ty_generics as __WincodeFieldPlan<#lifetime __WincodeConfig>>::RUNS
+    };
+    (definition, access)
 }
 
 fn anon_ident_iter(prefix: Option<&str>) -> impl Iterator<Item = Ident> + Clone + use<'_> {

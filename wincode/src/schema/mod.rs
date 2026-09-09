@@ -61,6 +61,8 @@ pub mod context;
 mod external;
 mod impls;
 pub mod int_encoding;
+#[cfg(all(test, feature = "std", feature = "derive"))]
+mod static_run_tests;
 pub mod tag_encoding;
 
 /// Indicates what kind of assumptions can be made when encoding or decoding a type.
@@ -91,6 +93,31 @@ pub enum TypeMeta {
     },
     /// The type has a dynamic size, and no optimizations can be made.
     Dynamic,
+}
+
+/// One declaration's role in a derive's field execution plan.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldRun {
+    /// Start a static run ending at `end` (exclusive), with `size` wire bytes.
+    Static { end: usize, size: usize },
+    /// Process this dynamic field through the parent reader or writer.
+    Dynamic,
+    /// This declaration is covered by an earlier static run.
+    Covered,
+}
+
+impl FieldRun {
+    /// Exclusive end of this operation's field range, starting at `start`.
+    /// Covered entries have an empty range.
+    #[expect(clippy::arithmetic_side_effects)]
+    pub const fn end(self, start: usize) -> usize {
+        match self {
+            Self::Static { end, .. } => end,
+            Self::Dynamic => start + 1,
+            Self::Covered => start,
+        }
+    }
 }
 
 impl TypeMeta {
@@ -202,35 +229,42 @@ impl TypeMeta {
         }
     }
 
-    /// How many leading `types` have a statically known size.
+    /// Plan sequential fields as maximal static runs and individual dynamic fields.
     ///
-    /// One dynamic field makes the whole struct [`Self::Dynamic`], but the leading fields still
-    /// have a fixed total size, so the derive can reserve a trusted window for them.
+    /// Each static run starts with [`FieldRun::Static`], followed by
+    /// [`FieldRun::Covered`] entries. Dynamic fields use [`FieldRun::Dynamic`].
+    /// Skipped declarations should be supplied as zero-sized static fields.
+    #[doc(hidden)]
     #[expect(clippy::arithmetic_side_effects)]
-    pub const fn static_prefix_len<const N: usize>(types: [Self; N]) -> usize {
-        let mut len = 0;
-        while len < N {
-            match types[len] {
-                Self::Static { .. } => len += 1,
-                Self::Dynamic => break,
-            }
-        }
-        len
-    }
-
-    /// Summed serialized size of the fields counted by [`Self::static_prefix_len`].
-    #[expect(clippy::arithmetic_side_effects)]
-    pub const fn static_prefix_size<const N: usize>(types: [Self; N]) -> usize {
-        let mut acc = 0;
+    pub const fn field_runs<const N: usize>(types: [Self; N]) -> [FieldRun; N] {
+        let mut runs = [FieldRun::Covered; N];
         let mut i = 0;
         while i < N {
             match types[i] {
-                Self::Static { size, .. } => acc += size,
-                Self::Dynamic => break,
+                Self::Dynamic => {
+                    runs[i] = FieldRun::Dynamic;
+                    i += 1;
+                }
+                Self::Static { .. } => {
+                    let start = i;
+                    let mut total = 0usize;
+                    while i < N {
+                        let Self::Static { size, .. } = types[i] else {
+                            break;
+                        };
+                        total = total
+                            .checked_add(size)
+                            .expect("static field run size overflows usize");
+                        i += 1;
+                    }
+                    runs[start] = FieldRun::Static {
+                        end: i,
+                        size: total,
+                    };
+                }
             }
-            i += 1;
         }
-        acc
+        runs
     }
 }
 
@@ -2077,9 +2111,9 @@ mod tests {
         ));
     }
 
-    /// Round-trip against bincode for each shape the prefix window can take.
+    /// Round-trip against bincode for runs before, between, and after dynamic fields.
     #[test]
-    fn dynamic_struct_static_prefix_roundtrips() {
+    fn dynamic_struct_static_runs_roundtrip() {
         #[derive(
             SchemaWrite, SchemaRead, Debug, PartialEq, serde::Serialize, serde::Deserialize,
         )]
@@ -2139,6 +2173,18 @@ mod tests {
             let encoded = serialize(value).unwrap();
             assert_eq!(encoded, bincode::serialize(value).unwrap());
             assert_eq!(&deserialize::<T>(&encoded).unwrap(), value);
+            assert_eq!(
+                &T::get(crate::io::std_read::ReadAdapter::new(encoded.as_slice())).unwrap(),
+                value,
+            );
+            let mut output = Vec::new();
+            crate::serialize_into(crate::io::std_write::WriteAdapter::new(&mut output), value)
+                .unwrap();
+            assert_eq!(output, encoded);
+            for len in 0..encoded.len() {
+                assert!(deserialize::<T>(&encoded[..len]).is_err());
+                assert!(crate::serialize_into(&mut output[..len], value).is_err());
+            }
         }
 
         for tail in [vec![], vec![7u8; 5]] {

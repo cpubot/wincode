@@ -1,6 +1,6 @@
 //! What a struct's field layout costs its encoding and decoding.
 //!
-//! The derive emits one read or write per field at constant offsets, so how much the backend
+//! The derive groups adjacent static fields into trusted windows, so how much the backend
 //! can merge, and how many bounds checks it can drop, follows from the fields themselves:
 //! where they sit, and which of them have a size known ahead of time. Arms in a group encode
 //! the same number of wire bytes -- the size the group is named for -- so a gap between two of
@@ -27,7 +27,7 @@ use {
     },
 };
 
-/// Serialized size shared by all three arms.
+/// Serialized size shared by all arms.
 const WIRE: usize = 32;
 
 /// No dynamic field, so every offset is fixed.
@@ -92,7 +92,7 @@ impl Prefixed {
     }
 }
 
-/// Dynamic field first, so no offset is fixed. Control: should not move.
+/// Dynamic field first, followed by a 30-byte static run.
 #[derive(SchemaWrite, SchemaRead)]
 struct Suffixed {
     head: Option<u8>,
@@ -118,6 +118,94 @@ impl Suffixed {
             e: 6,
             a: 7,
             b: 8,
+        }
+    }
+}
+
+/// Two static runs separated by a dynamic field.
+#[derive(SchemaWrite, SchemaRead)]
+struct Middle {
+    h: u64,
+    i: u64,
+    middle: Option<u8>,
+    f: u32,
+    g: u32,
+    d: u16,
+    e: u16,
+    a: u8,
+    b: u8,
+}
+
+impl Middle {
+    fn new() -> Self {
+        Self {
+            h: 1,
+            i: 2,
+            middle: Some(11),
+            f: 3,
+            g: 4,
+            d: 5,
+            e: 6,
+            a: 7,
+            b: 8,
+        }
+    }
+}
+
+/// Three static runs interleaved with three dynamic fields.
+#[derive(SchemaWrite, SchemaRead)]
+struct Alternating {
+    h: u64,
+    i: u64,
+    first: Option<u8>,
+    f: u32,
+    d: u16,
+    second: Option<u8>,
+    e: u16,
+    a: u8,
+    b: u8,
+    third: Option<u8>,
+}
+
+impl Alternating {
+    fn new() -> Self {
+        Self {
+            h: 1,
+            i: 2,
+            first: Some(9),
+            f: 3,
+            d: 4,
+            second: Some(10),
+            e: 5,
+            a: 6,
+            b: 7,
+            third: Some(11),
+        }
+    }
+}
+
+/// Every static run contains just one field.
+#[derive(SchemaWrite, SchemaRead)]
+struct Singletons {
+    a: u64,
+    first: Option<u8>,
+    b: u64,
+    second: Option<u8>,
+    c: u64,
+    third: Option<u8>,
+    d: u16,
+}
+
+impl Singletons {
+    fn new() -> Self {
+        Self {
+            a: 1,
+            first: Some(5),
+            b: 2,
+            second: Some(6),
+            c: 3,
+            third: Some(7),
+            d: 4,
         }
     }
 }
@@ -160,11 +248,11 @@ where
     }
 }
 
-/// Where a dynamic field sits. Nothing after one has a fixed offset, so the arms differ in how
-/// many of their fields keep theirs. That field is an `Option<u8>`: its size varies with the
+/// Where dynamic fields sit determines the number and size of static runs. Within each run,
+/// offsets are fixed relative to its start. Dynamic fields use `Option<u8>`: its size varies with the
 /// variant, but it is owned, tiny and allocation-free, so neither side pays for anything else.
 #[inline(never)]
-fn bench_static_prefix(c: &mut Criterion) {
+fn bench_static_runs(c: &mut Criterion) {
     let mut group = c.benchmark_group("Struct32");
     group.throughput(Throughput::Elements(1));
 
@@ -186,9 +274,28 @@ fn bench_static_prefix(c: &mut Criterion) {
         run_deserialize(Suffixed::new, |s| deserialize::<Suffixed>(s).unwrap()),
     );
 
+    group.bench_function("middle/serialize_into", run_serialize(Middle::new));
+    group.bench_function(
+        "middle/deserialize",
+        run_deserialize(Middle::new, |s| deserialize::<Middle>(s).unwrap()),
+    );
+    group.bench_function(
+        "alternating/serialize_into",
+        run_serialize(Alternating::new),
+    );
+    group.bench_function(
+        "alternating/deserialize",
+        run_deserialize(Alternating::new, |s| deserialize::<Alternating>(s).unwrap()),
+    );
+    group.bench_function("singletons/serialize_into", run_serialize(Singletons::new));
+    group.bench_function(
+        "singletons/deserialize",
+        run_deserialize(Singletons::new, |s| deserialize::<Singletons>(s).unwrap()),
+    );
+
     group.finish();
 }
 
-criterion_group!(benches, bench_static_prefix);
+criterion_group!(benches, bench_static_runs);
 
 criterion_main!(benches);

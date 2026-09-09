@@ -3,7 +3,8 @@ use {
         assert_zero_copy::assert_zero_copy,
         common::{
             Field, FieldsExt, SchemaArgs, StructRepr, TraitImpl, TypeExt, Variant, VariantsExt,
-            default_tag_encoding, extract_repr, generic_field_types, get_crate_name,
+            default_tag_encoding, extract_repr, field_plan, generic_field_types, get_crate_name,
+            helper_args,
         },
     },
     darling::{
@@ -13,7 +14,7 @@ use {
     proc_macro2::{Literal, TokenStream},
     quote::quote,
     syn::{
-        DeriveInput, GenericParam, Generics, Ident, Lifetime, Path, PredicateType, Token, Type,
+        DeriveInput, GenericParam, Generics, Lifetime, Path, PredicateType, Token, Type,
         WhereClause, WherePredicate, parse_quote, punctuated::Punctuated,
     },
 };
@@ -35,9 +36,25 @@ fn impl_struct(
     }
 
     let num_fields = fields.len();
-    // One field's read, taken from `reader` and behind `guard`, so the caller can emit the
-    // same field for both sides of the split.
-    let read_field = |i: usize, field: &Field, reader: &Ident, guard: TokenStream| {
+    let mut helper_generics = append_generics(
+        &args.generics,
+        &args.data,
+        crate_name,
+        args.context.as_ref(),
+    );
+    let (plan_definition, plan) = field_plan(
+        args,
+        fields,
+        &helper_generics,
+        TraitImpl::SchemaRead,
+        crate_name,
+    );
+    let context_value = if context_requires_copy(&args.data) {
+        quote! { *ctx.as_ref().expect("context available for each field") }
+    } else {
+        quote! { ctx.take().expect("context consumed by exactly one field") }
+    };
+    let reads = fields.iter().enumerate().map(|(i, field)| {
         let ident = field.struct_member_ident(i);
         let fully_qualified = field.target_fully_qualified(TraitImpl::SchemaRead);
         let declared_ty = &field.ty;
@@ -83,8 +100,8 @@ fn impl_struct(
                     quote! {
                         #assert_safe_lifetime_shortening
                         #fully_qualified::read_with_context(
-                            ctx,
-                            #crate_name::io::Reader::by_ref(&mut #reader),
+                            #context_value,
+                            #crate_name::io::Reader::by_ref(&mut reader),
                             unsafe { &mut *(&raw mut (*dst_ptr).#ident).cast::<#read_dst_ty>() }
                         )?;
                         #init_count
@@ -94,7 +111,7 @@ fn impl_struct(
                     quote! {
                         #assert_safe_lifetime_shortening
                         #fully_qualified::read(
-                            #crate_name::io::Reader::by_ref(&mut #reader),
+                            #crate_name::io::Reader::by_ref(&mut reader),
                             unsafe { &mut *(&raw mut (*dst_ptr).#ident).cast::<#read_dst_ty>() }
                         )?;
                         #init_count
@@ -102,11 +119,14 @@ fn impl_struct(
                 }
             }
         };
-        quote! { if #guard { #body } }
-    };
-
-    let reader_ident: Ident = parse_quote!(reader);
-    let prefix_reader: Ident = parse_quote!(__wincode_prefix);
+        quote! {
+            if const {
+                __WINCODE_START <= #i && #i < #plan[__WINCODE_START].end(__WINCODE_START)
+            } {
+                #body
+            }
+        }
+    });
 
     let type_meta_impl = fields.type_meta_impl(TraitImpl::SchemaRead, repr, crate_name);
 
@@ -145,37 +165,46 @@ fn impl_struct(
     };
 
     let ident = &args.ident;
-    // The leading statically sized fields have a known total size, so they are read from a
-    // trusted window and the rest from the parent reader. Each guard compares the field's
-    // position among those that reach the wire, so the boundary falls between declarations:
-    // the drop guard requires initialization in declaration order, and a skipped field
-    // initializes without consuming the reader.
-    let mut prefix_metas = Vec::with_capacity(num_fields);
-    let mut prefix_reads = Vec::with_capacity(num_fields);
-    let mut suffix_reads = Vec::with_capacity(num_fields);
-    let mut unskipped_count = 0usize;
-
-    for (i, field) in fields.iter().enumerate() {
-        prefix_reads.push(read_field(
-            i,
-            field,
-            &prefix_reader,
-            quote! { #unskipped_count < __wincode_prefix_len },
-        ));
-        suffix_reads.push(read_field(
-            i,
-            field,
-            &reader_ident,
-            quote! { #unskipped_count >= __wincode_prefix_len },
-        ));
-
-        if field.skip.is_none() {
-            let target = field.target_fully_qualified(TraitImpl::SchemaRead);
-            prefix_metas.push(quote! { #target::TYPE_META });
-            unskipped_count += 1;
+    let helper_args = helper_args(&helper_generics);
+    helper_generics
+        .params
+        .push(parse_quote!(const __WINCODE_START: usize));
+    let (helper_impl_generics, _, helper_where_clause) = helper_generics.split_for_impl();
+    let (context_init, context_param, context_arg) = match &args.context {
+        Some(ctx) => (
+            quote! { let mut ctx = ::core::option::Option::Some(ctx); },
+            quote! { ctx: &mut ::core::option::Option<#ctx>, },
+            quote! { &mut ctx, },
+        ),
+        None => (quote! {}, quote! {}, quote! {}),
+    };
+    // Scalar const conditions let rustc prune unused helper specializations.
+    // Matching the FieldRun enum directly only removes them later, in LLVM.
+    let operations = (0..num_fields).map(|i| {
+        quote! {
+            if const { ::core::matches!(#plan[#i], #crate_name::FieldRun::Static { .. }) } {
+                let size = const {
+                    match #plan[#i] {
+                        #crate_name::FieldRun::Static { size, .. } => size,
+                        _ => 0,
+                    }
+                };
+                // SAFETY: this range contains only static (or skipped) fields.
+                // Their schema sizes sum to exactly the reserved window size.
+                let window = unsafe {
+                    #crate_name::io::Reader::as_trusted_for(&mut reader, size)
+                }?;
+                __wincode_read_fields::<#(#helper_args,)* #i>(
+                    window, dst_ptr, init_count, #context_arg
+                )?;
+            } else if const { ::core::matches!(#plan[#i], #crate_name::FieldRun::Dynamic) } {
+                __wincode_read_fields::<#(#helper_args,)* #i>(
+                    #crate_name::io::Reader::by_ref(&mut reader),
+                    dst_ptr, init_count, #context_arg
+                )?;
+            }
         }
-    }
-
+    });
     let (impl_generics, ty_generics, where_clause) = args.generics.split_for_impl();
     let init_guard = quote! {
         let dst_ptr = dst.as_mut_ptr();
@@ -205,24 +234,25 @@ fn impl_struct(
                 }
             }
 
-            #init_guard
-            let __wincode_prefix_len = const {
-                #crate_name::TypeMeta::static_prefix_len([#(#prefix_metas),*])
-            };
-            if __wincode_prefix_len > 0 {
-                let __wincode_prefix_size = const {
-                    #crate_name::TypeMeta::static_prefix_size([#(#prefix_metas),*])
-                };
-                // SAFETY: `__wincode_prefix_size` is the sum of the serialized sizes of the
-                // first `__wincode_prefix_len` fields, which are each statically sized.
-                // Calling `read` on each of those fields will consume exactly
-                // `__wincode_prefix_size` bytes, fully consuming the trusted window.
-                let mut #prefix_reader = unsafe {
-                    #crate_name::io::Reader::as_trusted_for(&mut reader, __wincode_prefix_size)
-                }?;
-                #(#prefix_reads)*
+            #plan_definition
+
+            // Each field body is emitted once. Const guards prune excluded reads
+            // before LLVM, including in debug builds.
+            #[inline(always)]
+            #[allow(clippy::multiple_bound_locations)]
+            fn __wincode_read_fields #helper_impl_generics (
+                mut reader: impl #crate_name::io::Reader<'de>,
+                dst_ptr: *mut #ident #ty_generics,
+                init_count: &mut #counter_ty,
+                #context_param
+            ) -> #crate_name::ReadResult<()> #helper_where_clause {
+                #(#reads)*
+                Ok(())
             }
-            #(#suffix_reads)*
+
+            #init_guard
+            #context_init
+            #(#operations)*
             ::core::mem::forget(guard);
         },
         quote! {
